@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ================================
+# Super Import Script (PROD)
+# Usage: ./super-import.sh vpc-xxxxxxxx
+# ================================
+
+VPC_ID="${1:-}"
+
+if [[ -z "$VPC_ID" ]]; then
+  echo "❌ ERROR: Missing VPC ID"
+  echo "Usage: ./super-import.sh vpc-123abc"
+  exit 1
+fi
+
+# Region detection (fallback to us-east-1)
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+TFVARS_FILE="prod.tfvars"
+TFVARS="-var-file=${TFVARS_FILE}"
+
+echo "============================================"
+echo "🚀 SUPER IMPORT for VPC: $VPC_ID (region: $REGION)"
+echo "============================================"
+
+# ---------------------------------------------
+# PHASE 1: DISCOVER + GENERATE prod.tfvars
+# ---------------------------------------------
+echo "🔍 Discovering VPC CIDR..."
+VPC_CIDR=$(aws ec2 describe-vpcs \
+  --vpc-ids "$VPC_ID" \
+  --region "$REGION" \
+  --query "Vpcs[0].CidrBlock" \
+  --output text)
+
+if [[ -z "$VPC_CIDR" || "$VPC_CIDR" == "None" ]]; then
+  echo "❌ Could not find VPC CIDR for $VPC_ID"
+  exit 1
+fi
+
+echo "➡ VPC CIDR: $VPC_CIDR"
+
+echo "🔍 Discovering subnets..."
+SUBNETS_JSON=$(aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --region "$REGION")
+
+PUBLIC_SUBNETS=()
+PRIVATE_SUBNETS=()
+PUB_CIDRS=()
+PRI_CIDRS=()
+AZS=()
+
+for row in $(echo "$SUBNETS_JSON" | jq -r '.Subnets[] | @base64'); do
+  _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
+
+  SUBNET_ID=$(_jq '.SubnetId')
+  CIDR=$(_jq '.CidrBlock')
+  MAP_PUBLIC=$(_jq '.MapPublicIpOnLaunch')
+  AZ=$(_jq '.AvailabilityZone')
+
+  AZS+=("$AZ")
+
+  if [[ "$MAP_PUBLIC" == "true" ]]; then
+    PUBLIC_SUBNETS+=( "$SUBNET_ID" )
+    PUB_CIDRS+=( "$CIDR" )
+  else
+    PRIVATE_SUBNETS+=( "$SUBNET_ID" )
+    PRI_CIDRS+=( "$CIDR" )
+  fi
+done
+
+if [[ ${#PUBLIC_SUBNETS[@]} -eq 0 ]]; then
+  echo "⚠ WARNING: No public subnets detected (MapPublicIpOnLaunch=true)."
+fi
+if [[ ${#PRIVATE_SUBNETS[@]} -eq 0 ]]; then
+  echo "⚠ WARNING: No private subnets detected."
+fi
+
+# Deduplicate AZs
+AZS=($(printf "%s\n" "${AZS[@]}" | sort -u))
+
+echo "➡ Public Subnets:  ${PUBLIC_SUBNETS[*]}"
+echo "➡ Private Subnets: ${PRIVATE_SUBNETS[*]}"
+echo "➡ AZs:             ${AZS[*]}"
+
+echo "📝 Generating ${TFVARS_FILE} from discovered values..."
+
+{
+  echo "environment = \"prod\""
+  echo "region      = \"${REGION}\""
+  echo ""
+  echo "vpc_cidr = \"${VPC_CIDR}\""
+  echo ""
+  echo "public_subnet_cidrs = ["
+  for c in "${PUB_CIDRS[@]}"; do
+    echo "  \"${c}\","
+  done
+  echo "]"
+  echo ""
+  echo "private_subnet_cidrs = ["
+  for c in "${PRI_CIDRS[@]}"; do
+    echo "  \"${c}\","
+  done
+  echo "]"
+  echo ""
+  echo "azs = ["
+  for a in "${AZS[@]}"; do
+    echo "  \"${a}\","
+  done
+  echo "]"
+} > "${TFVARS_FILE}"
+
+echo "✅ Generated ${TFVARS_FILE}:"
+cat "${TFVARS_FILE}"
+
+# ---------------------------------------------
+# PHASE 2: terraform init + plan (sanity check)
+# ---------------------------------------------
+echo "🧩 Running terraform init..."
+terraform init -input=false
+
+echo "🧪 Running terraform plan (pre-import sanity)..."
+terraform plan $TFVARS || echo "⚠ Plan reported changes (expected before import). Continuing..."
+
+# ---------------------------------------------
+# PHASE 3: IMPORT RESOURCES
+# ---------------------------------------------
+echo "============================================"
+echo "📥 IMPORTING RESOURCES INTO TERRAFORM STATE"
+echo "============================================"
+
+# ---- VPC ----
+echo "➡ Importing VPC..."
+terraform import $TFVARS module.vpc.aws_vpc.this "$VPC_ID"
+
+# ---- Subnets already discovered above (PUBLIC_SUBNETS, PRIVATE_SUBNETS) ----
+echo "➡ Importing Public Subnets..."
+idx=0
+for subnet in "${PUBLIC_SUBNETS[@]}"; do
+  echo "  - Public subnet ${subnet} -> index ${idx}"
+  terraform import $TFVARS "module.public_subnets.aws_subnet.this[\"${idx}\"]" "$subnet"
+  idx=$((idx+1))
+done
+
+echo "➡ Importing Private Subnets..."
+idx=0
+for subnet in "${PRIVATE_SUBNETS[@]}"; do
+  echo "  - Private subnet ${subnet} -> index ${idx}"
+  terraform import $TFVARS "module.private_subnets.aws_subnet.this[\"${idx}\"]" "$subnet"
+  idx=$((idx+1))
+done
+
+# ---- IGW ----
+echo "🔍 Discovering Internet Gateway..."
+IGW_ID=$(aws ec2 describe-internet-gateways \
+  --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+  --region "$REGION" \
+  --query "InternetGateways[0].InternetGatewayId" \
+  --output text)
+
+if [[ "$IGW_ID" != "None" && -n "$IGW_ID" ]]; then
+  echo "➡ Importing IGW: $IGW_ID"
+  terraform import $TFVARS module.gateways.aws_internet_gateway.igw[0] "$IGW_ID"
+else
+  echo "⚠ No Internet Gateway found for VPC $VPC_ID"
+fi
+
+# ---- NAT Gateways + EIPs ----
+echo "🔍 Discovering NAT Gateways..."
+NATS=$(aws ec2 describe-nat-gateways \
+  --filter "Name=vpc-id,Values=$VPC_ID" \
+  --region "$REGION")
+
+NAT_IDS=($(echo "$NATS" | jq -r '.NatGateways[].NatGatewayId'))
+EIP_ALLOC_IDS=($(echo "$NATS" | jq -r '.NatGateways[].NatGatewayAddresses[].AllocationId'))
+
+echo "➡ NAT Gateways: ${NAT_IDS[*]}"
+echo "➡ NAT EIP Alloc IDs: ${EIP_ALLOC_IDS[*]}"
+
+idx=0
+for alloc in "${EIP_ALLOC_IDS[@]}"; do
+  echo "  - Importing NAT EIP $alloc -> index ${idx}"
+  terraform import $TFVARS "module.gateways.aws_eip.nat[${idx}]" "$alloc"
+  idx=$((idx+1))
+done
+
+idx=0
+for nat in "${NAT_IDS[@]}"; do
+  echo "  - Importing NAT Gateway $nat -> index ${idx}"
+  terraform import $TFVARS "module.gateways.aws_nat_gateway.nat_gw[${idx}]" "$nat"
+  idx=$((idx+1))
+done
+
+# ---------------------------------------------
+# Route Tables + Associations by subnet
+# ---------------------------------------------
+echo "🔍 Discovering Route Tables + Associations..."
+RTB_JSON=$(aws ec2 describe-route-tables \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --region "$REGION")
+
+declare -A RTB_BY_SUBNET
+declare -A ASSOC_BY_SUBNET
+
+# Build maps: subnet -> { rtb_id, assoc_id }
+for row in $(echo "$RTB_JSON" | jq -r '.RouteTables[] | @base64'); do
+  _jq_table() { echo "$row" | base64 --decode | jq -r "$1"; }
+  RTB_ID=$(_jq_table '.RouteTableId')
+
+  # Get all non-main associations with a SubnetId
+  for assoc in $(echo "$row" | base64 --decode | jq -r '.Associations[]? | select(.SubnetId != null) | @base64'); do
+    _jq_assoc() { echo "$assoc" | base64 --decode | jq -r "$1"; }
+    SUBNET_ID=$(_jq_assoc '.SubnetId')
+    ASSOC_ID=$(_jq_assoc '.RouteTableAssociationId')
+    RTB_BY_SUBNET["$SUBNET_ID"]="$RTB_ID"
+    ASSOC_BY_SUBNET["$SUBNET_ID"]="$ASSOC_ID"
+  done
+done
+
+# Build ordered RTB arrays aligned with subnet arrays
+PUBLIC_RTB_IDS=()
+PRIVATE_RTB_IDS=()
+PUBLIC_ASSOC_IDS=()
+PRIVATE_ASSOC_IDS=()
+
+for subnet in "${PUBLIC_SUBNETS[@]}"; do
+  PUBLIC_RTB_IDS+=( "${RTB_BY_SUBNET[$subnet]:-}" )
+  PUBLIC_ASSOC_IDS+=( "${ASSOC_BY_SUBNET[$subnet]:-}" )
+done
+
+for subnet in "${PRIVATE_SUBNETS[@]}"; do
+  PRIVATE_RTB_IDS+=( "${RTB_BY_SUBNET[$subnet]:-}" )
+  PRIVATE_ASSOC_IDS+=( "${ASSOC_BY_SUBNET[$subnet]:-}" )
+done
+
+echo "➡ Public RTBs (by index):  ${PUBLIC_RTB_IDS[*]}"
+echo "➡ Private RTBs (by index): ${PRIVATE_RTB_IDS[*]}"
+
+# Import Route Tables
+echo "➡ Importing Public Route Tables..."
+idx=0
+for rtb in "${PUBLIC_RTB_IDS[@]}"; do
+  if [[ -n "$rtb" && "$rtb" != "null" ]]; then
+    echo "  - Public RTB $rtb -> index ${idx}"
+    terraform import $TFVARS "module.route_tables.aws_route_table.public[${idx}]" "$rtb"
+  else
+    echo "  ⚠ Skipping public RTB index ${idx} (no RTB found for subnet ${PUBLIC_SUBNETS[$idx]})"
+  fi
+  idx=$((idx+1))
+done
+
+echo "➡ Importing Private Route Tables..."
+idx=0
+for rtb in "${PRIVATE_RTB_IDS[@]}"; do
+  if [[ -n "$rtb" && "$rtb" != "null" ]]; then
+    echo "  - Private RTB $rtb -> index ${idx}"
+    terraform import $TFVARS "module.route_tables.aws_route_table.private[${idx}]" "$rtb"
+  else
+    echo "  ⚠ Skipping private RTB index ${idx} (no RTB found for subnet ${PRIVATE_SUBNETS[$idx]})"
+  fi
+  idx=$((idx+1))
+done
+
+# Import Route Table Associations (your Option A)
+echo "➡ Importing Public Route Table Associations..."
+idx=0
+for assoc_id in "${PUBLIC_ASSOC_IDS[@]}"; do
+  if [[ -n "$assoc_id" && "$assoc_id" != "null" ]]; then
+    echo "  - Public RTB Association $assoc_id -> index ${idx}"
+    terraform import $TFVARS "module.route_tables.aws_route_table_association.public_assoc[${idx}]" "$assoc_id"
+  else
+    echo "  ⚠ Skipping public association index ${idx} (no association found for subnet ${PUBLIC_SUBNETS[$idx]})"
+  fi
+  idx=$((idx+1))
+done
+
+echo "➡ Importing Private Route Table Associations..."
+idx=0
+for assoc_id in "${PRIVATE_ASSOC_IDS[@]}"; do
+  if [[ -n "$assoc_id" && "$assoc_id" != "null" ]]; then
+    echo "  - Private RTB Association $assoc_id -> index ${idx}"
+    terraform import $TFVARS "module.route_tables.aws_route_table_association.private_assoc[${idx}]" "$assoc_id"
+  else
+    echo "  ⚠ Skipping private association index ${idx} (no association found for subnet ${PRIVATE_SUBNETS[$idx]})"
+  fi
+  idx=$((idx+1))
+done
+
+# ---------------------------------------------
+# PHASE 4: FINAL PLAN
+# ---------------------------------------------
+echo "============================================"
+echo "✅ IMPORT PHASE COMPLETED"
+echo "🧪 Running final terraform plan..."
+echo "============================================"
+
+terraform plan $TFVARS
+
+echo "🎉 Done. If plan shows 'No changes', your import is perfect."
